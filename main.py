@@ -13,6 +13,7 @@ Variables (set in Railway -> your service -> Variables):
                          above 0.06
                          below 0.03
                          mcap above 100M
+                         mcap every 5M            <- fires each time mcap crosses another $5M, up or down
                          above 0.08 sell half     <- text after the number is shown in the alert
 
   Optional:
@@ -42,6 +43,7 @@ STATE_DIR = Path(os.environ.get("STATE_DIR") or os.environ.get("RAILWAY_VOLUME_M
 STATE_FILE = STATE_DIR / "state.json"
 FAILURES_BEFORE_WARNING = 5
 HTTP_TIMEOUT = 15
+STEP_DEADBAND = 0.05  # for "every X" alerts: value must clear a band edge by 5% of the step before firing
 TELEGRAM_LONG_POLL = 20  # seconds getUpdates waits for a message; also paces the main loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
@@ -127,7 +129,36 @@ LINE_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+STEP_RE = re.compile(
+    r"""
+    ^\s*
+    (?:(?P<metric>price|mcap|mc|market\s*cap|marketcap)\s+)?
+    every\s+\$?\s*(?P<num>\d[\d,]*\.?\d*|\.\d+)\s*
+    (?P<suf>[kmb])?
+    (?![\w.])
+    \s*(?P<note>.*?)\s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 SUFFIX = {"k": 1e3, "m": 1e6, "b": 1e9}
+
+
+class StepAlert:
+    """Fires each time the metric crosses another multiple of `step` (up or down)."""
+    __slots__ = ("metric", "step", "note", "key", "raw")
+
+    def __init__(self, metric, step, note, raw):
+        self.metric, self.step, self.note, self.raw = metric, step, note, raw
+        self.key = f"step:{metric}:{step:.10g}"
+
+    def band(self, v):
+        return math.floor(v / self.step)
+
+    def describe(self):
+        s = f"{self.metric} every {fmt_value(self.metric, self.step)}"
+        if self.note:
+            s += f" - {self.note}"
+        return s
 
 
 class Threshold:
@@ -152,19 +183,45 @@ class Threshold:
         return s
 
 
+def _metric_of(raw_metric, value, suffix):
+    """Normalise the metric word. When unspecified, a K/M/B or >=1000 value means market cap."""
+    m = (raw_metric or "").lower().replace(" ", "")
+    if m in ("mcap", "mc", "marketcap"):
+        return "mcap"
+    if m == "price":
+        return "price"
+    return "mcap" if (suffix or value >= 1000) else "price"
+
+
 def parse_alerts(text):
-    """ALERTS may use newlines or ';' as separators. Returns (thresholds, bad_lines)."""
-    thresholds, bad, seen = [], [], set()
+    """ALERTS may use newlines or ';' as separators. Returns (thresholds, steps, bad_lines)."""
+    thresholds, steps, bad, seen = [], [], [], set()
     for chunk in text.replace(";", "\n").splitlines():
         body = chunk.split("#", 1)[0].strip()
         if not body:
+            continue
+        sm = STEP_RE.match(body)
+        if sm:
+            try:
+                value = float(sm.group("num").replace(",", ""))
+            except ValueError:
+                bad.append(body)
+                continue
+            if sm.group("suf"):
+                value *= SUFFIX[sm.group("suf").lower()]
+            if value <= 0:
+                bad.append(body)
+                continue
+            metric = _metric_of(sm.group("metric"), value, sm.group("suf"))
+            s = StepAlert(metric, value, sm.group("note").strip(), body)
+            if s.key not in seen:
+                seen.add(s.key)
+                steps.append(s)
             continue
         m = LINE_RE.match(body)
         if not m:
             bad.append(body)
             continue
-        metric = (m.group("metric") or "price").lower().replace(" ", "")
-        metric = "mcap" if metric in ("mcap", "mc", "marketcap") else "price"
         d = m.group("dir").lower()
         direction = "above" if d in ("above", "over", ">", ">=") else "below"
         try:
@@ -177,11 +234,12 @@ def parse_alerts(text):
         if value <= 0:
             bad.append(body)
             continue
+        metric = _metric_of(m.group("metric"), value, m.group("suf")) if m.group("metric") else "price"
         t = Threshold(metric, direction, value, m.group("note").strip(), body)
         if t.key not in seen:
             seen.add(t.key)
             thresholds.append(t)
-    return thresholds, bad
+    return thresholds, steps, bad
 
 
 # --------------------------------------------------------------------------- price feed
@@ -259,6 +317,7 @@ def load_state():
     except (OSError, ValueError):
         st = {}
     st.setdefault("thresholds", {})
+    st.setdefault("steps", {})
     st.setdefault("last_heartbeat", None)
     st.setdefault("failing", False)
     return st
@@ -284,9 +343,11 @@ class Watcher:
         self.tg = tg or Telegram(cfg["bot_token"])
         self.now = now or (lambda: datetime.now(cfg["tz"]))
         self.state = load_state()
-        self.thresholds, self.bad_lines = parse_alerts(cfg["alerts_text"])
-        live = {t.key for t in self.thresholds}
-        self.state["thresholds"] = {k: v for k, v in self.state["thresholds"].items() if k in live}
+        self.thresholds, self.steps, self.bad_lines = parse_alerts(cfg["alerts_text"])
+        live_t = {t.key for t in self.thresholds}
+        live_s = {s.key for s in self.steps}
+        self.state["thresholds"] = {k: v for k, v in self.state["thresholds"].items() if k in live_t}
+        self.state["steps"] = {k: v for k, v in self.state["steps"].items() if k in live_s}
         self.last_quote = None
         self.fail_count = 0
         self.started = time.time()
@@ -305,13 +366,19 @@ class Watcher:
             return False
 
     def alert_lines(self, mark_state=True):
-        if not self.thresholds:
+        if not self.thresholds and not self.steps:
             return ["No alerts set - add the ALERTS variable in Railway."]
         out = []
         for t in self.thresholds:
             fired = self.state["thresholds"].get(t.key, {}).get("fired")
             tag = "⏸ " if (fired and mark_state) else "• "
             out.append(tag + html.escape(t.describe()))
+        for s in self.steps:
+            at = ""
+            band = self.state["steps"].get(s.key, {}).get("band")
+            if band is not None and mark_state:
+                at = f" (now ~{fmt_value(s.metric, band * s.step)})"
+            out.append("🔁 " + html.escape(s.describe()) + at)
         for raw in self.bad_lines:
             out.append("⚠️ not understood: <code>" + html.escape(raw) + "</code>")
         return out
@@ -341,6 +408,31 @@ class Watcher:
                 st["fired"] = False
                 changed = True
                 log.info("re-armed: %s (now %s)", t.describe(), fmt_value(t.metric, v))
+        for s in self.steps:
+            v = q.get(s.metric)
+            if v is None or v <= 0:
+                continue
+            cur = s.band(v)
+            st = self.state["steps"].get(s.key)
+            if st is None:                       # first sighting - record band, never fire
+                self.state["steps"][s.key] = {"band": cur}
+                changed = True
+                continue
+            last = st["band"]
+            if cur == last:
+                continue
+            d = s.step * STEP_DEADBAND           # ignore chatter right on a band edge
+            if cur > last and v < (last + 1) * s.step + d:
+                continue
+            if cur < last and v > last * s.step - d:
+                continue
+            if startup:                          # crossed while we were offline - adopt silently
+                st["band"] = cur
+                changed = True
+                continue
+            if self.fire_step(s, q, last, cur):
+                st["band"] = cur
+                changed = True
         if changed:
             save_state(self.state)
         return already
@@ -352,6 +444,22 @@ class Watcher:
                 f"Now {fmt_price(q['price'])} | mcap {fmt_big(q.get('mcap'))} | 24h {fmt_pct(q.get('change24'))}")
         if t.note:
             text += f"\n▶️ <b>{html.escape(t.note)}</b>"
+        text += f'\n<a href="{html.escape(q["url"])}">Chart</a>'
+        return self.send(text)
+
+    def fire_step(self, s, q, last, cur):
+        sym = html.escape(q.get("symbol") or self.cfg["name"])
+        up = cur > last
+        edge = cur * s.step if up else (cur + 1) * s.step
+        arrow = "🔼" if up else "🔽"
+        word = "up through" if up else "down through"
+        text = (f"{arrow} <b>{sym} {s.metric} {word} {fmt_value(s.metric, edge)}</b>\n"
+                f"Now {fmt_price(q['price'])} | mcap {fmt_big(q.get('mcap'))} | 24h {fmt_pct(q.get('change24'))}")
+        jumped = abs(cur - last)
+        if jumped > 1:
+            text += f"\n({jumped} × {fmt_value(s.metric, s.step)} bands in one move)"
+        if s.note:
+            text += f"\n▶️ <b>{html.escape(s.note)}</b>"
         text += f'\n<a href="{html.escape(q["url"])}">Chart</a>'
         return self.send(text)
 
