@@ -445,12 +445,18 @@ class Watcher:
         return self.repeat_send(text)
 
     # -- heartbeat ----------------------------------------------------------
-    def maybe_heartbeat(self, q):
+    def maybe_heartbeat(self, q, startup=False):
         if not self.cfg["heartbeat"]:
             return
         now = self.now()
         today = now.date().isoformat()
         if now.hour < self.cfg["heartbeat_hour"] or self.state["last_heartbeat"] == today:
+            return
+        if startup:
+            # A deploy/restart is not the 8am heartbeat. Today's slot already passed, so
+            # mark it done and wait for tomorrow - the "watcher is live" banner covers launch.
+            self.state["last_heartbeat"] = today
+            save_state(self.state)
             return
         if self.send(f"❤️ <b>Alive</b> · {self.mc(q)}", silent=True):
             self.state["last_heartbeat"] = today
@@ -477,7 +483,7 @@ class Watcher:
         self.last_quote = q
         log.info("%s %s mcap %s", q.get("symbol"), fmt_price(q["price"]), fmt_big(q.get("mcap")))
         already = self.evaluate(q, startup=startup)
-        self.maybe_heartbeat(q)
+        self.maybe_heartbeat(q, startup=startup)
         return q, already
 
     # -- telegram commands --------------------------------------------------
