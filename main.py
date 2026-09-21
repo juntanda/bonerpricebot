@@ -437,9 +437,6 @@ class Watcher:
         edge = cur * s.step if up else (cur + 1) * s.step
         arrow = "🔼" if up else "🔽"
         text = f"{arrow} <b>{fmt_value(s.metric, q.get(s.metric))}</b> · passed {fmt_mark(s.metric, edge)}"
-        jumped = abs(cur - last)
-        if jumped > 1:
-            text += f" ({jumped} marks in one move)"
         if s.note:
             text += f"\n▶️ <b>{html.escape(s.note)}</b>"
         return self.repeat_send(text)
@@ -469,14 +466,17 @@ class Watcher:
         except Exception as e:  # noqa: BLE001
             self.fail_count += 1
             log.warning("fetch failed (%d in a row): %s", self.fail_count, e)
-            if self.fail_count == FAILURES_BEFORE_WARNING and not self.state["failing"]:
+            # Only warn about a feed we had actually been receiving - never at cold start.
+            if (self.fail_count == FAILURES_BEFORE_WARNING and not self.state["failing"]
+                    and self.last_quote is not None):
                 if self.send(f"⚠️ <b>No feed</b> · {human_secs(FAILURES_BEFORE_WARNING * self.cfg['poll'])} "
                              f"— DexScreener not responding, still retrying"):
                     self.state["failing"] = True
                     save_state(self.state)
             return None
         if self.state["failing"]:
-            self.send("✅ <b>Feed back</b>", silent=True)
+            if not startup:
+                self.send("✅ <b>Feed back</b>", silent=True)
             self.state["failing"] = False
             save_state(self.state)
         self.fail_count = 0
@@ -510,7 +510,10 @@ class Watcher:
             if cmd in ("/status", "/start", "/alive"):
                 dur = human_mins(int((time.time() - self.started) / 60))
                 mc = f" · {self.mc(self.last_quote)}" if self.last_quote else ""
-                self.reply(chat_id, f"✅ {dur}{mc}")
+                if self.state.get("failing"):
+                    self.reply(chat_id, f"⚠️ {dur}{mc} · feed down, retrying")
+                else:
+                    self.reply(chat_id, f"✅ {dur}{mc}")
             else:
                 self.reply(chat_id, "Send /status to check I'm alive and see the current market cap. "
                                     "Alerts are set in Railway (ALERTS).")
@@ -541,8 +544,7 @@ class Watcher:
         lines += ["", "<b>Messages you'll see</b>"]
         if s:
             lines += ["🔼 <b>$50.0M</b> · passed $50M — crossed a mark going up",
-                      "🔽 <b>$49.0M</b> · passed $50M — crossed a mark going down",
-                      '   (a big jump adds "2 marks in one move")']
+                      "🔽 <b>$49.0M</b> · passed $50M — crossed a mark going down"]
         for t in self.thresholds:
             lines.append(f"📈/📉 one-shot: {html.escape(t.describe())}")
         try:
@@ -551,14 +553,21 @@ class Watcher:
             tzabbr = ""
         when = f"{self.cfg['heartbeat_hour']}:00" + (f" {tzabbr}" if tzabbr else "")
         lines += [f"❤️ Alive · {mc} — daily silent check around {when}, means I'm still running",
-                  f"✅ · {mc} — my reply when you send /status",
+                  f"✅ · {mc} — reply to /status (✅ = feed healthy, ⚠️ = feed down)",
                   "⚠️ No feed — data dropped · ✅ Feed back — data restored"]
         return "\n".join(lines)
 
     # -- main loop ----------------------------------------------------------
     def run(self):
-        result = self.tick(startup=True)
-        q = result[0] if result else None
+        # Wait (quietly) for the first good price so the launch banner is the first message,
+        # even if DexScreener is slow to answer at cold start.
+        q = None
+        for _ in range(40):
+            result = self.tick(startup=True)
+            if result:
+                q = result[0]
+                break
+            time.sleep(self.cfg["poll"])
         if not self.cfg["chat_id"]:
             log.warning("TELEGRAM_CHAT_ID is not set. Message the bot and it will reply with the chat id.")
         else:
