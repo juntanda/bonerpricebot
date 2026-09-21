@@ -497,8 +497,8 @@ class Watcher:
         for m in msgs:
             chat_id = str((m.get("chat") or {}).get("id", ""))
             text = (m.get("text") or "").strip()
-            if not chat_id:
-                continue
+            if not chat_id or not text:
+                continue                      # skip service notices (pins, joins) - they carry no text
             if not self.cfg["chat_id"]:
                 self.reply(chat_id, f"Your chat id is <code>{chat_id}</code>.\n\nIn Railway add "
                                     f"<code>TELEGRAM_CHAT_ID</code> = <code>{chat_id}</code> and deploy. "
@@ -506,7 +506,9 @@ class Watcher:
                 continue
             if chat_id != self.cfg["chat_id"]:
                 continue
-            cmd = text.split()[0].lower() if text else ""
+            if not text.startswith("/"):
+                continue                      # ignore ordinary group chatter - only answer commands
+            cmd = text.split()[0].lower().split("@", 1)[0]   # handle /status@BotName in groups
             if cmd in ("/status", "/start", "/alive"):
                 dur = human_mins(int((time.time() - self.started) / 60))
                 mc = f" · {self.mc(self.last_quote)}" if self.last_quote else ""
