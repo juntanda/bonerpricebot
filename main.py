@@ -350,7 +350,7 @@ class Watcher:
     # -- messaging (never raises) -------------------------------------------
     def send(self, text_html, silent=False):
         if not self.cfg["chat_id"]:
-            log.warning("no TELEGRAM_CHAT_ID - not sent: %s", re.sub("<[^>]+>", "", text_html)[:120])
+            log.warning("no chat id - not sent: %s", re.sub("<[^>]+>", "", text_html)[:120])
             return False
         try:
             self.tg.send(self.cfg["chat_id"], text_html, silent)
@@ -370,6 +370,16 @@ class Watcher:
             if self.cfg["repeat_gap"] > 0:
                 time.sleep(self.cfg["repeat_gap"])
             self.send(text_html)
+        return ok
+
+    def burst_send(self, info_html, emphasis_html):
+        """Send the info line a few times (1s apart), then one arrow-only emphasis line last."""
+        reps = self.cfg["repeats"]
+        ok = self.send(info_html)
+        for i in range(1, reps):
+            if self.cfg["repeat_gap"] > 0:
+                time.sleep(self.cfg["repeat_gap"])
+            self.send(emphasis_html if i == reps - 1 else info_html)
         return ok
 
     # -- evaluation ---------------------------------------------------------
@@ -436,10 +446,10 @@ class Watcher:
         up = cur > last
         edge = cur * s.step if up else (cur + 1) * s.step
         arrow = "🔼" if up else "🔽"
-        text = f"{arrow} <b>{fmt_value(s.metric, q.get(s.metric))}</b> · passed {fmt_mark(s.metric, edge)}"
+        text = f"{arrow} <b>{fmt_value(s.metric, q.get(s.metric))}</b> «« {fmt_mark(s.metric, edge)}"
         if s.note:
             text += f"\n▶️ <b>{html.escape(s.note)}</b>"
-        return self.repeat_send(text)
+        return self.burst_send(text, arrow * 7)
 
     # -- heartbeat ----------------------------------------------------------
     def maybe_heartbeat(self, q, startup=False):
@@ -542,11 +552,13 @@ class Watcher:
                       f"• Coming down: pings once it's a full {cush} below the mark, "
                       "so wobble on a line won't double-ping."]
             if self.cfg["repeats"] > 1:
-                lines.append(f"• Each crossing is sent {self.cfg['repeats']}× (1s apart) so you can't miss it.")
+                lines.append("• Each crossing repeats a few times, then ends with a 7-arrow line "
+                             "(🔼 up / 🔽 down) so you can't miss it.")
         lines += ["", "<b>Messages you'll see</b>"]
         if s:
-            lines += ["🔼 <b>$50.0M</b> · passed $50M — crossed a mark going up",
-                      "🔽 <b>$49.0M</b> · passed $50M — crossed a mark going down"]
+            lines += ["🔼 <b>$50.0M</b> «« $50M — crossed a mark going up",
+                      "🔽 <b>$49.0M</b> «« $50M — crossed a mark going down",
+                      "🔼🔼🔼🔼🔼🔼🔼 — the arrow line, sent last for at-a-glance direction"]
         for t in self.thresholds:
             lines.append(f"📈/📉 one-shot: {html.escape(t.describe())}")
         try:
