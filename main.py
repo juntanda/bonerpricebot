@@ -71,6 +71,8 @@ def load_settings():
         "bot_token": env("TELEGRAM_BOT_TOKEN"),
         "chat_id": env("TELEGRAM_CHAT_ID"),
         "poll": max(DEXSCREENER_MIN_POLL, int(env("POLL_SECONDS", "60"))),
+        "feed_alert_secs": max(60, int(env("FEED_ALERT_MINUTES", "3")) * 60),  # loud alert only after this much continuous downtime
+        "status_edit_secs": max(15, int(env("STATUS_REFRESH_SECONDS", "60"))),  # how often the pinned status refreshes
         "heartbeat": env("HEARTBEAT", "on").lower() in ("on", "yes", "true", "1"),
         "heartbeat_hour": int(env("HEARTBEAT_HOUR", "8")),
         "timezone": env("TIMEZONE", "America/New_York"),
@@ -294,6 +296,18 @@ class Telegram:
         return self.call("sendMessage", chat_id=chat_id, text=text_html, parse_mode="HTML",
                          disable_web_page_preview=True, disable_notification=silent)
 
+    def edit(self, chat_id, message_id, text_html):
+        try:
+            return self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=text_html,
+                             parse_mode="HTML", disable_web_page_preview=True)
+        except RuntimeError as e:
+            if "not modified" in str(e).lower():   # same text as last edit - not an error
+                return None
+            raise
+
+    def pin(self, chat_id, message_id):
+        return self.call("pinChatMessage", chat_id=chat_id, message_id=message_id, disable_notification=True)
+
     def updates(self, wait=TELEGRAM_LONG_POLL):
         res = self.call("getUpdates", http_timeout=wait + HTTP_TIMEOUT,
                         offset=self.offset, timeout=wait, allowed_updates=["message"])
@@ -313,7 +327,7 @@ def load_state():
     st.setdefault("thresholds", {})
     st.setdefault("steps", {})
     st.setdefault("last_heartbeat", None)
-    st.setdefault("failing", False)
+    st.setdefault("status_msg_id", None)
     return st
 
 
@@ -346,6 +360,10 @@ class Watcher:
         self.last_quote = None
         self.fail_count = 0
         self.started = time.time()
+        self.down_since = None            # wall-clock time the current feed outage began (None = feed OK)
+        self.anomaly_alerted = False      # sent the "down 10min" loud alert for this outage yet?
+        self.status_msg_id = self.state.get("status_msg_id")   # the pinned, self-editing status message
+        self.last_status_edit = 0.0
 
     # -- messaging (never raises) -------------------------------------------
     def send(self, text_html, silent=False):
@@ -469,31 +487,94 @@ class Watcher:
             self.state["last_heartbeat"] = today
             save_state(self.state)
 
+    # -- pinned status message ----------------------------------------------
+    def adopt_existing_status(self):
+        """On relaunch, reuse the status message already pinned in the chat instead of pinning a second one."""
+        if not self.cfg["chat_id"] or self.status_msg_id:
+            return
+        try:
+            me = self.tg.call("getMe")
+            chat = self.tg.call("getChat", chat_id=self.cfg["chat_id"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not check for an existing pinned status: %s", e)
+            return
+        pinned = (chat or {}).get("pinned_message")
+        if not pinned:
+            return
+        from_id = (pinned.get("from") or {}).get("id")
+        txt = pinned.get("text") or ""
+        if from_id == me.get("id") and ("feed live" in txt or "feed down" in txt):
+            self.status_msg_id = pinned["message_id"]
+            self.state["status_msg_id"] = self.status_msg_id
+            save_state(self.state)
+            log.info("re-using existing pinned status message %s", self.status_msg_id)
+
+    def status_text(self):
+        ts = self.now().strftime("%I:%M %p").lstrip("0")
+        if self.down_since is None:
+            mc = self.mc(self.last_quote) if self.last_quote else "?"
+            return f"✅ <b>BONER {mc}</b> · feed live · {ts}"
+        mins = int((time.time() - self.down_since) / 60)
+        last = self.mc(self.last_quote) if self.last_quote else "?"
+        span = f"{mins}min" if mins >= 1 else "<1min"
+        return f"⚠️ <b>BONER feed down {span}</b> · last {last} · {ts}"
+
+    def update_status(self, force=False):
+        if not self.cfg["chat_id"]:
+            return
+        now = time.time()
+        if not force and now - self.last_status_edit < self.cfg["status_edit_secs"]:
+            return
+        self.last_status_edit = now
+        text = self.status_text()
+        if not self.status_msg_id:                       # create it once, then pin
+            try:
+                res = self.tg.send(self.cfg["chat_id"], text, silent=True)
+                self.status_msg_id = res.get("message_id")
+                self.state["status_msg_id"] = self.status_msg_id
+                save_state(self.state)
+                self.tg.pin(self.cfg["chat_id"], self.status_msg_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("status create/pin failed: %s", e)
+            return
+        try:
+            self.tg.edit(self.cfg["chat_id"], self.status_msg_id, text)   # silent edit, no notification
+        except Exception as e:  # noqa: BLE001
+            log.warning("status edit failed (%s); will recreate", e)
+            self.status_msg_id = None
+
     # -- one price check ----------------------------------------------------
     def tick(self, startup=False):
         try:
             q = self.fetch()
         except Exception as e:  # noqa: BLE001
             self.fail_count += 1
-            log.warning("fetch failed (%d in a row): %s", self.fail_count, e)
-            # Only warn about a feed we had actually been receiving - never at cold start.
-            if (self.fail_count == FAILURES_BEFORE_WARNING and not self.state["failing"]
-                    and self.last_quote is not None):
-                if self.send(f"⚠️ <b>No feed</b> · {human_secs(FAILURES_BEFORE_WARNING * self.cfg['poll'])} "
-                             f"— DexScreener not responding, still retrying"):
-                    self.state["failing"] = True
-                    save_state(self.state)
+            flip = self.down_since is None
+            if flip:
+                self.down_since = time.time()
+            down_secs = time.time() - self.down_since
+            log.warning("fetch failed (%.0fs down): %s", down_secs, e)
+            # ONE loud alert, only after a real outage (continuous downtime >= threshold).
+            if not self.anomaly_alerted and down_secs >= self.cfg["feed_alert_secs"] and self.last_quote is not None:
+                mins = int(down_secs / 60)
+                self.send(f"⚠️ <b>Feed down {mins}min</b> — DexScreener still not responding. "
+                          f"Price alerts are paused until it's back.")
+                self.anomaly_alerted = True
+            self.update_status(force=flip)               # silent pinned-status edit
             return None
-        if self.state["failing"]:
-            if not startup:
-                self.send("✅ <b>Feed back</b>", silent=True)
-            self.state["failing"] = False
-            save_state(self.state)
+        # success
+        recovered_from_outage = self.down_since is not None
+        notify_recovery = self.anomaly_alerted           # only if we'd sent the loud "down" alert
+        self.down_since = None
+        self.anomaly_alerted = False
         self.fail_count = 0
         self.last_quote = q
         log.info("%s %s mcap %s", q.get("symbol"), fmt_price(q["price"]), fmt_big(q.get("mcap")))
+        if notify_recovery and not startup:
+            self.send("✅ <b>Feed back</b> — data restored.")
         already = self.evaluate(q, startup=startup)
         self.maybe_heartbeat(q, startup=startup)
+        self.update_status(force=recovered_from_outage)
         return q, already
 
     # -- telegram commands --------------------------------------------------
@@ -522,8 +603,9 @@ class Watcher:
             if cmd in ("/status", "/start", "/alive"):
                 dur = human_mins(int((time.time() - self.started) / 60))
                 mc = f" · {self.mc(self.last_quote)}" if self.last_quote else ""
-                if self.state.get("failing"):
-                    self.reply(chat_id, f"⚠️ {dur}{mc} · feed down, retrying")
+                if self.down_since is not None:
+                    down = human_mins(int((time.time() - self.down_since) / 60))
+                    self.reply(chat_id, f"⚠️ {dur}{mc} · feed down {down}, retrying")
                 else:
                     self.reply(chat_id, f"✅ {dur}{mc}")
             else:
@@ -566,13 +648,17 @@ class Watcher:
         except Exception:  # noqa: BLE001
             tzabbr = ""
         when = f"{self.cfg['heartbeat_hour']}:00" + (f" {tzabbr}" if tzabbr else "")
+        alert_mins = self.cfg["feed_alert_secs"] // 60
         lines += [f"❤️ Alive · {mc} — daily silent check around {when}, means I'm still running",
                   f"✅ · {mc} — reply to /status (✅ = feed healthy, ⚠️ = feed down)",
-                  "⚠️ No feed — data dropped · ✅ Feed back — data restored"]
+                  "📌 A pinned status message shows the feed live and updates silently.",
+                  f"⚠️ You only get a loud alert if the feed is down {alert_mins}min straight (a real outage)."]
         return "\n".join(lines)
 
     # -- main loop ----------------------------------------------------------
     def run(self):
+        # If a status message is already pinned from a previous run, reuse it (keeps just one pinned).
+        self.adopt_existing_status()
         # Wait (quietly) for the first good price so the launch banner is the first message,
         # even if DexScreener is slow to answer at cold start.
         q = None
@@ -586,6 +672,7 @@ class Watcher:
             log.warning("TELEGRAM_CHAT_ID is not set. Message the bot and it will reply with the chat id.")
         else:
             self.send(self.startup_message(q), silent=True)
+            self.update_status(force=True)        # create + pin the self-editing status message
         next_fetch = time.monotonic() + self.cfg["poll"]
         while True:
             try:
