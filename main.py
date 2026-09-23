@@ -509,6 +509,15 @@ class Watcher:
             save_state(self.state)
             log.info("re-using existing pinned status message %s", self.status_msg_id)
 
+    def pin_status(self):
+        """Pin the status message. Needs the bot to be a group admin with 'Pin Messages'."""
+        if not (self.cfg["chat_id"] and self.status_msg_id):
+            return
+        try:
+            self.tg.pin(self.cfg["chat_id"], self.status_msg_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not pin status (make the bot a group admin with 'Pin Messages'): %s", e)
+
     def status_text(self):
         ts = self.now().strftime("%I:%M %p").lstrip("0")
         if self.down_since is None:
@@ -527,15 +536,16 @@ class Watcher:
             return
         self.last_status_edit = now
         text = self.status_text()
-        if not self.status_msg_id:                       # create it once, then pin
+        if not self.status_msg_id:                       # create it once (pinning handled separately)
             try:
                 res = self.tg.send(self.cfg["chat_id"], text, silent=True)
                 self.status_msg_id = res.get("message_id")
                 self.state["status_msg_id"] = self.status_msg_id
                 save_state(self.state)
-                self.tg.pin(self.cfg["chat_id"], self.status_msg_id)
             except Exception as e:  # noqa: BLE001
-                log.warning("status create/pin failed: %s", e)
+                log.warning("status create failed: %s", e)
+                return
+            self.pin_status()
             return
         try:
             self.tg.edit(self.cfg["chat_id"], self.status_msg_id, text)   # silent edit, no notification
@@ -672,7 +682,8 @@ class Watcher:
             log.warning("TELEGRAM_CHAT_ID is not set. Message the bot and it will reply with the chat id.")
         else:
             self.send(self.startup_message(q), silent=True)
-            self.update_status(force=True)        # create + pin the self-editing status message
+            self.update_status(force=True)        # create the self-editing status message
+            self.pin_status()                     # (re)pin it every launch, once permission is granted
         next_fetch = time.monotonic() + self.cfg["poll"]
         while True:
             try:
