@@ -308,6 +308,12 @@ class Telegram:
     def pin(self, chat_id, message_id):
         return self.call("pinChatMessage", chat_id=chat_id, message_id=message_id, disable_notification=True)
 
+    def delete(self, chat_id, message_id):
+        try:
+            return self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
+        except Exception:  # noqa: BLE001
+            return None
+
     def updates(self, wait=TELEGRAM_LONG_POLL):
         res = self.call("getUpdates", http_timeout=wait + HTTP_TIMEOUT,
                         offset=self.offset, timeout=wait, allowed_updates=["message"])
@@ -550,8 +556,19 @@ class Watcher:
         try:
             self.tg.edit(self.cfg["chat_id"], self.status_msg_id, text)   # silent edit, no notification
         except Exception as e:  # noqa: BLE001
-            log.warning("status edit failed (%s); will recreate", e)
-            self.status_msg_id = None
+            msg = str(e).lower()
+            gone = any(k in msg for k in ("not found", "message to edit", "message to be edited",
+                                          "can't be edited", "cant be edited", "message_id_invalid"))
+            if gone:
+                # The status message is really gone or too old to edit - drop the old one and recreate once.
+                log.warning("status message unusable (%s); recreating", e)
+                self.tg.delete(self.cfg["chat_id"], self.status_msg_id)
+                self.status_msg_id = None
+                self.state["status_msg_id"] = None
+                save_state(self.state)
+            else:
+                # Transient hiccup - keep the same message and just try again next cycle (no new pin).
+                log.warning("status edit hiccup, keeping message: %s", e)
 
     # -- one price check ----------------------------------------------------
     def tick(self, startup=False):
@@ -682,8 +699,7 @@ class Watcher:
             log.warning("TELEGRAM_CHAT_ID is not set. Message the bot and it will reply with the chat id.")
         else:
             self.send(self.startup_message(q), silent=True)
-            self.update_status(force=True)        # create the self-editing status message
-            self.pin_status()                     # (re)pin it every launch, once permission is granted
+            self.update_status(force=True)        # create (and pin) the status message, or reuse the existing one
         next_fetch = time.monotonic() + self.cfg["poll"]
         while True:
             try:
